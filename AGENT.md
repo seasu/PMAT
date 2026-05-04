@@ -3,6 +3,7 @@
 ## 📍 1. 當前會話快照 (Context Snapshot)
 > **STATUS:** 任務進行中 - 框架初始化與技能萃取階段。
 - **Last Sync:** 2026-05-04
+- **Battery Level:** 🟢 [電量充足] (Claude/Cursor/Gemini 狀態標記)
 - **Project Goal:** 建立一套跨工具 (Claude Code, Cursor, Gemini CLI)、跨平台 (Flutter, Roblox, Web)、低 Token 消耗的手機開發流程。
 - **Current Task:** 正在準備從現有的 GitHub Repos 中萃取 GitHub Actions 部署邏輯，轉換為 `SKILLS/` 檔案。
 - **Next Step:** 接收用戶貼上的 `.github/workflows/*.yml` 內容，並將其轉化為 `SKILLS/xxx/SKILL.md`。
@@ -18,12 +19,19 @@
 | **Developer** | 功能實作、撰寫代碼、確保符合風格規範。 | `src/`, `lib/`, `pubspec.yaml` |
 | **Reviewer** | 程式碼審查、Debug、資安檢查。 | 變動的 Diff, Test Logs |
 | **Skill Extractor**| 分析 CI/CD 配置，將部署邏輯模組化。 | `.github/workflows/`, `SKILLS/` |
-
 ---
 
 ## 🛠️ 3. 跨工具協作規範 (Cross-Tool Protocol)
 1. **SSOT (唯一事實來源):** 本檔案 `AGENT.md` 是專案的大腦。任何工具在啟動時必須先讀取此檔案。
-2. **存檔指令 (`/checkpoint`):** 在更換 AI 工具前，當前 AI 必須摘要進度並更新 `[CURRENT_STATE]` 區塊。
+2. **技能調度 (Skill Dispatch):** 當涉及 CI/CD、部署或特定平台操作時，AI 必須主動讀取 `SKILLS/` 目錄下的對應 `SKILL.md`。
+3. **電量預警機制 (Battery Protocol):** 
+   - AI 必須監控對話長度與 Context 消耗。
+   - 每 5~8 輪對話，或在處理大量檔案後，AI 應主動在回覆末尾標註當前 `Battery Level`。
+   - 🟢 **[電量充足]**: Context 尚短，可進行複雜任務。
+   - 🟡 **[電量消耗中]**: Context 變長，建議開始準備小結。
+   - 🔴 **[建議換手]**: Context 已滿，建議執行 `/shift` 移交給下一個 AI 以節省 Token。
+4. **存檔指令 (`/checkpoint`):** 在更換 AI 工具前，當前 AI 必須摘要進度並更新 `[CURRENT_STATE]` 區塊。
+...
 3. **移交指令 (`/shift`):** 當 Token 耗盡需更換工具時，生成「遺言摘要」並執行 `git commit`。
 4. **手機優化:** 檔案模組化，單一檔案原則上不超過 200 行，以利手機閱讀與 Context 管理。
 
@@ -33,10 +41,13 @@
 所有的外部自動化與部署邏輯均存放於 `SKILLS/` 資料夾。
 
 - **運作模式:** 核心大腦 (AGENT.md) 僅持有技能索引。當涉及特定平台（如 Flutter 或 Roblox）的部署時，AI 必須主動讀取 `SKILLS/platform/SKILL.md`。
-- **現有技能索引預備:**
-    - `SKILLS/flutter-deploy/`: 透過 GitHub Actions 處理 iOS/Android 部署。
-    - `SKILLS/roblox-sync/`: 透過 Rojo 與 Open Cloud API 同步遊戲內容。
-    - `SKILLS/web-deploy/`: 處理前端網站的 CI/CD。
+- **現有技能索引:**
+    - `SKILLS/flutter-deploy/`: 透過 GitHub Actions 處理 iOS/Android 全平台編譯與發佈 (Play Store/TestFlight)。
+    - `SKILLS/hosting-deploy/`: 處理 Firebase Hosting 部署與 App Links / Universal Links 指紋注入。
+    - `SKILLS/functions-deploy/`: 部署 Cloud Functions、Firestore 規則與環境變數同步。
+    - `SKILLS/preview-gen/`: 透過 Gemini AI 自動產生貼圖風格預覽圖並自動開啟 PR。
+    - `SKILLS/pr-check/`: PR 階段的版本守衛 (Version Guard) 與代碼品質檢查。
+    - `SKILLS/roblox-deploy/`: 透過 Rojo 與 Open Cloud API 同步並部署 Roblox 遊戲內容。
 
 ---
 

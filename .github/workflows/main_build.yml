@@ -1,0 +1,611 @@
+name: Magic Sticker CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: '發版說明（選填，留空自動產生）'
+        required: false
+        default: ''
+
+jobs:
+  # ─── Dart Analyze（所有觸發均先跑，快速 fail-fast）──────────────
+  dart-analyze:
+    name: Dart Analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.1'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Dart analyze
+        run: dart analyze --fatal-infos
+
+  # ─── Android Build（所有觸發均跑，需先通過 Dart Analyze）────────
+  android-build:
+    name: Android Build
+    runs-on: ubuntu-latest
+    needs: dart-analyze
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.1'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons -f flutter_launcher_icons_android.yaml
+
+      - name: Set up Python (for Pillow image resize)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate small app icon for runtime (128×128)
+        run: |
+          pip install Pillow --quiet
+          python3 - <<'EOF'
+          from PIL import Image
+          img = Image.open('assets/app_icon.png').resize((128, 128), Image.LANCZOS)
+          img.save('assets/images/app_icon_small.png')
+          print(f"✅ app_icon_small.png created: {img.size}")
+          EOF
+
+      - name: Write google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON_ANDROID }}
+        run: |
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "❌ ERROR: GOOGLE_SERVICES_JSON_ANDROID secret is not set"
+            exit 1
+          fi
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          python3 -c "import json,sys; d=json.load(open('android/app/google-services.json')); assert 'project_info' in d, 'missing project_info'; p=d['project_info'].get('project_id',''); assert 'placeholder' not in p, 'placeholder project: '+p; print('OK project_id='+p)"
+
+      - name: Setup Android Release Signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "⚠️ WARNING: ANDROID_KEYSTORE_BASE64 not set, using debug signing"
+          else
+            echo "$KEYSTORE_BASE64" | base64 --decode > android/upload-keystore.jks
+            cat > android/key.properties <<EOF
+          storePassword=${STORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=../upload-keystore.jks
+          EOF
+            echo "✅ Release keystore configured"
+          fi
+
+      # Play Store 要求每次上傳的 versionCode 必須嚴格遞增。
+      # 以 (github.run_number + 1000) 作為 versionCode：
+      #   +1000 offset 確保永遠高於過去 pubspec 手動設定的舊 build 號碼（曾達 ~430）。
+      - name: Set versionCode = run_number + 1000
+        run: |
+          VER_NAME=$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)
+          VERSION_CODE=$(( ${{ github.run_number }} + 1000 ))
+          sed -i "s/^version:.*/version: ${VER_NAME}+${VERSION_CODE}/" pubspec.yaml
+          echo "✅ pubspec version: $(grep '^version:' pubspec.yaml | awk '{print $2}')"
+
+      - name: Build APK (release)
+        run: |
+          flutter build apk --release \
+            --split-per-abi \
+            --obfuscate \
+            --split-debug-info=build/symbols/android \
+            --dart-define=STICKER_BG_TRANSPARENT=${{ vars.STICKER_BG_TRANSPARENT || 'true' }} \
+            --dart-define=DOMAIN_BASE=${{ vars.DOMAIN_BASE || 'https://magic-sticker-8eaf4.web.app' }}
+
+      - name: Build AAB (release)
+        run: |
+          flutter build appbundle --release \
+            --obfuscate \
+            --split-debug-info=build/symbols/android \
+            --dart-define=STICKER_BG_TRANSPARENT=${{ vars.STICKER_BG_TRANSPARENT || 'true' }} \
+            --dart-define=DOMAIN_BASE=${{ vars.DOMAIN_BASE || 'https://magic-sticker-8eaf4.web.app' }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aab
+          path: build/app/outputs/bundle/release/app-release.aab
+
+      - name: Upload mapping.txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-mapping
+          path: build/app/outputs/mapping/release/mapping.txt
+
+      - name: Upload Android debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-symbols
+          path: build/symbols/android/
+          retention-days: 90
+
+  # ─── GitHub Release ───────────────────────────────────────────
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: android-build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from pubspec.yaml
+        id: ver
+        run: |
+          RAW=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          echo "raw=$RAW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$RAW"  >> "$GITHUB_OUTPUT"
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: dist/
+
+      - name: Rename APK with version
+        run: mv dist/app-arm64-v8a-release.apk "dist/MagicSticker-${{ steps.ver.outputs.raw }}.apk"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "Magic Sticker ${{ steps.ver.outputs.raw }}"
+          body: |
+            ## 📦 Magic Sticker `${{ steps.ver.outputs.raw }}`
+
+            ${{ github.event.inputs.release_notes != '' && github.event.inputs.release_notes || format('> 自動建置 · commit `{0}`', github.sha) }}
+
+            ### 安裝方式
+            1. 下載下方 `MagicSticker-*.apk`
+            2. 手機開啟「允許安裝未知來源」
+            3. 點擊 APK 安裝
+          files: "dist/MagicSticker-${{ steps.ver.outputs.raw }}.apk"
+          make_latest: true
+          fail_on_unmatched_files: true
+
+  # ─── Firebase App Distribution ────────────────────────────
+  firebase-distribute:
+    name: Firebase App Distribution
+    runs-on: ubuntu-latest
+    needs: android-build
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+
+      - name: Upload to Firebase App Distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID_ANDROID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          groups: testers
+          file: app-arm64-v8a-release.apk
+          releaseNotes: |
+            ${{ github.event.inputs.release_notes != '' && github.event.inputs.release_notes || github.ref_name }}
+
+  # ─── Google Play Store Deploy ──────────────────────────────
+  play-store-deploy:
+    name: Google Play Store (internal track)
+    runs-on: ubuntu-latest
+    needs: android-build
+    steps:
+      - name: Download AAB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-aab
+          path: dist/
+
+      - name: Download mapping.txt
+        uses: actions/download-artifact@v4
+        with:
+          name: android-mapping
+          path: mapping/
+        continue-on-error: true
+
+      - name: Upload to Google Play (internal track)
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.magicsticker.magic_sticker
+          releaseFiles: dist/app-release.aab
+          track: internal
+          status: completed
+          mappingFile: mapping/mapping.txt
+
+  # ─── iOS Build & TestFlight（與 android-build 平行執行）─────────
+  ios-build:
+    name: iOS Build & TestFlight
+    runs-on: macos-15
+    needs: dart-analyze
+    steps:
+      - uses: actions/checkout@v4
+
+      # Apple 要求 2026/04/28 起所有 iOS/iPadOS App 必須以 iOS 26 SDK（Xcode 26）建置
+      - name: Select Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.1'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Initialize iOS platform
+        run: |
+          if [ ! -d "ios" ]; then
+            flutter create --platforms=ios --org com.magicsticker .
+            echo "✅ iOS platform initialized"
+          else
+            echo "✅ iOS platform already exists"
+          fi
+
+      - name: Configure iOS project
+        run: |
+          PBXPROJ="ios/Runner.xcodeproj/project.pbxproj"
+          # Bundle identifier
+          sed -i '' \
+            's/PRODUCT_BUNDLE_IDENTIFIER = .*/PRODUCT_BUNDLE_IDENTIFIER = com.magicsticker.magic-sticker;/g' \
+            "$PBXPROJ"
+          # iOS deployment target
+          sed -i '' \
+            's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*/IPHONEOS_DEPLOYMENT_TARGET = 15.0/g' \
+            "$PBXPROJ"
+          # Podfile platform
+          sed -i '' "s/# platform :ios, '[0-9.]*'/platform :ios, '15.0'/" ios/Podfile 2>/dev/null || true
+          sed -i '' "s/platform :ios, '[0-9.]*'/platform :ios, '15.0'/" ios/Podfile 2>/dev/null || true
+          # Display name
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleDisplayName 'Magic Sticker'" \
+            ios/Runner/Info.plist 2>/dev/null || \
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleDisplayName string 'Magic Sticker'" \
+            ios/Runner/Info.plist
+          # 加密合規聲明：App 不使用非豁免加密，跳過 TestFlight 合規問卷
+          /usr/libexec/PlistBuddy \
+            -c "Set :ITSAppUsesNonExemptEncryption false" \
+            ios/Runner/Info.plist 2>/dev/null || \
+          /usr/libexec/PlistBuddy \
+            -c "Add :ITSAppUsesNonExemptEncryption bool false" \
+            ios/Runner/Info.plist
+          # 使用 GitHub run number 作為 build number，確保 TestFlight 每次上傳唯一
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleVersion ${{ github.run_number }}" \
+            ios/Runner/Info.plist 2>/dev/null || \
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleVersion string ${{ github.run_number }}" \
+            ios/Runner/Info.plist
+          echo "✅ Bundle: com.magicsticker.magic-sticker, iOS 15.0+, build=${{ github.run_number }}"
+          # AdMob App ID — 有設定 secret 則用正式 ID，否則沿用 Info.plist 內的測試 ID
+          if [ -n "${{ secrets.IOS_ADMOB_APP_ID }}" ]; then
+            /usr/libexec/PlistBuddy \
+              -c "Set :GADApplicationIdentifier ${{ secrets.IOS_ADMOB_APP_ID }}" \
+              ios/Runner/Info.plist 2>/dev/null || \
+            /usr/libexec/PlistBuddy \
+              -c "Add :GADApplicationIdentifier string ${{ secrets.IOS_ADMOB_APP_ID }}" \
+              ios/Runner/Info.plist
+            echo "✅ GADApplicationIdentifier injected from secret"
+          else
+            echo "⚠️  IOS_ADMOB_APP_ID secret 未設定，使用 Info.plist 預設 Test App ID"
+          fi
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Set up Python (for Pillow image resize)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate small app icon for runtime (128×128)
+        run: |
+          pip install Pillow --quiet
+          python3 - <<'EOF'
+          from PIL import Image
+          img = Image.open('assets/app_icon.png').resize((128, 128), Image.LANCZOS)
+          img.save('assets/images/app_icon_small.png')
+          print(f"✅ app_icon_small.png created: {img.size}")
+          EOF
+
+      - name: Write GoogleService-Info.plist
+        env:
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+        run: |
+          if [ -z "$GOOGLE_SERVICE_INFO_PLIST" ]; then
+            echo "❌ GOOGLE_SERVICE_INFO_PLIST secret is missing"
+            exit 1
+          fi
+          printf '%s' "$GOOGLE_SERVICE_INFO_PLIST" > ios/Runner/GoogleService-Info.plist
+          echo "✅ GoogleService-Info.plist written"
+
+      - name: Inject REVERSED_CLIENT_ID into Info.plist URL scheme
+        run: |
+          # GoogleSignIn SDK 7.x 在呼叫 signIn 前會檢查 REVERSED_CLIENT_ID URL scheme 是否已
+          # 註冊於 CFBundleURLTypes，未註冊則直接拋 NSException 導致 crash。
+          # GoogleService-Info.plist 由 secret 注入，此步驟將其中的 REVERSED_CLIENT_ID 讀出
+          # 並以 PlistBuddy 寫入 Info.plist 的 CFBundleURLTypes。
+          REVERSED_CLIENT_ID=$(/usr/libexec/PlistBuddy \
+            -c "Print :REVERSED_CLIENT_ID" \
+            ios/Runner/GoogleService-Info.plist 2>/dev/null || echo "")
+          if [ -z "$REVERSED_CLIENT_ID" ] || [ "$REVERSED_CLIENT_ID" = "PLACEHOLDER" ]; then
+            echo "❌ REVERSED_CLIENT_ID 無法從 GoogleService-Info.plist 讀取，請確認 secret 正確"
+            exit 1
+          fi
+          echo "REVERSED_CLIENT_ID=${REVERSED_CLIENT_ID:0:30}…"
+          # 若 CFBundleURLTypes 不存在則先新增陣列
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleURLTypes array" \
+            ios/Runner/Info.plist 2>/dev/null || true
+          # 新增 Google Sign-In URL scheme entry
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleURLTypes:0 dict" \
+            ios/Runner/Info.plist 2>/dev/null || true
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" \
+            ios/Runner/Info.plist 2>/dev/null || true
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string $REVERSED_CLIENT_ID" \
+            ios/Runner/Info.plist 2>/dev/null || \
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 $REVERSED_CLIENT_ID" \
+            ios/Runner/Info.plist
+          echo "✅ CFBundleURLTypes 注入完成：$REVERSED_CLIENT_ID"
+
+      - name: Import Distribution Certificate
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          echo "$CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          echo "✅ Distribution certificate imported"
+
+      - name: Install Provisioning Profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          PP_PATH=$RUNNER_TEMP/profile.mobileprovision
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PP_PATH"
+          security cms -D -i "$PP_PATH" > /tmp/profile_decoded.plist
+          PP_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /tmp/profile_decoded.plist)
+          PP_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/profile_decoded.plist)
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"${PP_UUID}".mobileprovision
+          echo "PP_NAME=$PP_NAME" >> $GITHUB_ENV
+          echo "✅ Provisioning profile installed: $PP_NAME ($PP_UUID)"
+          # 驗證 profile 含有 Sign in with Apple entitlement
+          if /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.applesignin" /tmp/profile_decoded.plist 2>/dev/null; then
+            echo "✅ Profile contains Sign in with Apple entitlement"
+          else
+            echo "❌ Profile is MISSING Sign in with Apple entitlement — update the provisioning profile in Apple Developer Portal"
+            exit 1
+          fi
+
+      - name: Configure Xcode Manual Signing
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          PBXPROJ="ios/Runner.xcodeproj/project.pbxproj"
+          # Switch from Automatic to Manual signing
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$PBXPROJ"
+          # Inject team ID (handles both empty string and existing value)
+          sed -i '' "s/DEVELOPMENT_TEAM = \"\";/DEVELOPMENT_TEAM = $APPLE_TEAM_ID;/g" "$PBXPROJ"
+          sed -i '' "s/DEVELOPMENT_TEAM = [A-Z0-9]*;/DEVELOPMENT_TEAM = $APPLE_TEAM_ID;/g" "$PBXPROJ"
+          # Set provisioning profile specifier (replace existing or insert after CODE_SIGN_STYLE)
+          if grep -q "PROVISIONING_PROFILE_SPECIFIER" "$PBXPROJ"; then
+            sed -i '' "s/PROVISIONING_PROFILE_SPECIFIER = .*;/PROVISIONING_PROFILE_SPECIFIER = \"$PP_NAME\";/g" "$PBXPROJ"
+          else
+            sed -i '' "s/CODE_SIGN_STYLE = Manual;/CODE_SIGN_STYLE = Manual;\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = \"$PP_NAME\";/g" "$PBXPROJ"
+          fi
+          # Set code sign identity（涵蓋條件式 key 與舊式寫法）
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "iPhone Developer";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Distribution";/g' "$PBXPROJ"
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "Apple Development";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";/g' "$PBXPROJ"
+          sed -i '' 's/CODE_SIGN_IDENTITY = "iPhone Developer";/CODE_SIGN_IDENTITY = "iPhone Distribution";/g' "$PBXPROJ"
+          sed -i '' 's/CODE_SIGN_IDENTITY = "Apple Development";/CODE_SIGN_IDENTITY = "Apple Distribution";/g' "$PBXPROJ"
+          sed -i '' 's/CODE_SIGN_IDENTITY = "";/CODE_SIGN_IDENTITY = "Apple Distribution";/g' "$PBXPROJ"
+          echo "✅ Xcode project: Manual signing, team=$APPLE_TEAM_ID, profile=$PP_NAME"
+
+      - name: Create ExportOptions.plist
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          python3 - <<'PYEOF'
+          import plistlib, os
+          plist = {
+            'method': 'app-store',
+            'teamID': os.environ['APPLE_TEAM_ID'],
+            'signingStyle': 'manual',
+            'uploadBitcode': False,
+            'compileBitcode': False,
+            'uploadSymbols': True,
+            'provisioningProfiles': {
+              'com.magicsticker.magic-sticker': os.environ['PP_NAME']
+            }
+          }
+          with open('ios/ExportOptions.plist', 'wb') as f:
+            plistlib.dump(plist, f, fmt=plistlib.FMT_XML)
+          print('✅ ExportOptions.plist created (team:', os.environ['APPLE_TEAM_ID'], ')')
+          PYEOF
+
+      - name: Build IPA archive (no codesign)
+        run: |
+          flutter build ipa --release \
+            --no-codesign \
+            --obfuscate \
+            --split-debug-info=build/symbols/ios \
+            --dart-define=STICKER_BG_TRANSPARENT=${{ vars.STICKER_BG_TRANSPARENT || 'true' }} \
+            --dart-define=DOMAIN_BASE=${{ vars.DOMAIN_BASE || 'https://magic-sticker-8eaf4.web.app' }}
+
+      - name: Sign archive with entitlements
+        run: |
+          APP="build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
+          echo "--- Available identities ---"
+          security find-identity -v -p codesigning
+          echo "----------------------------"
+          CERT=$(security find-identity -v -p codesigning | grep -E "iPhone Distribution|Apple Distribution" | head -1 | awk '{print $2}')
+          echo "🔏 Certificate: $CERT"
+          [ -z "$CERT" ] && echo "❌ No distribution certificate found" && exit 1
+          # 先簽 Frameworks（內層 → 外層）
+          find "$APP/Frameworks" -name "*.framework" 2>/dev/null | while read f; do
+            codesign --force --sign "$CERT" --timestamp "$f" 2>/dev/null || true
+          done
+          # 簽主 App bundle，並注入 entitlements
+          codesign --force --sign "$CERT" \
+            --entitlements ios/Runner/Runner.entitlements \
+            --timestamp \
+            "$APP"
+          # 驗證
+          codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "applesignin" \
+            && echo "✅ Entitlements injected into archive" \
+            || (echo "❌ Entitlements injection failed" && exit 1)
+
+      - name: Export IPA with signing
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            -exportPath build/ios/ipa \
+            -exportOptionsPlist ios/ExportOptions.plist
+          echo "✅ IPA exported to build/ios/ipa/"
+
+      - name: Upload dSYMs to Firebase Crashlytics
+        # continue-on-error 確保 dSYM 上傳失敗不阻斷 TestFlight 發佈
+        continue-on-error: true
+        run: |
+          DSYM_DIR="build/ios/archive/Runner.xcarchive/dSYMs"
+          GSP_PATH="ios/Runner/GoogleService-Info.plist"
+
+          # upload-symbols 隨 FirebaseCrashlytics Pod 一起安裝
+          UPLOAD_SCRIPT=$(find ios/Pods/FirebaseCrashlytics -name "upload-symbols" 2>/dev/null | head -1)
+          if [ -z "$UPLOAD_SCRIPT" ]; then
+            echo "❌ upload-symbols 找不到，跳過 dSYM 上傳"
+            exit 1
+          fi
+          echo "✅ upload-symbols: $UPLOAD_SCRIPT"
+
+          # 列出 archive 內的 dSYM
+          echo "📦 dSYMs in archive:"
+          ls "$DSYM_DIR" || (echo "❌ dSYMs 目錄不存在" && exit 1)
+
+          # 逐一上傳每個 .dSYM
+          find "$DSYM_DIR" -name "*.dSYM" | while read dsym; do
+            echo "⬆️  Uploading: $(basename "$dsym")"
+            "$UPLOAD_SCRIPT" -gsp "$GSP_PATH" -p ios "$dsym"
+          done
+          echo "✅ dSYMs 已上傳至 Firebase Crashlytics"
+
+      - name: Verify IPA entitlements (Sign in with Apple)
+        run: |
+          IPA=$(ls build/ios/ipa/*.ipa | head -1)
+          echo "🔍 Checking IPA: $IPA"
+          WORK=$(mktemp -d)
+          unzip -q "$IPA" -d "$WORK"
+          APP=$(ls "$WORK/Payload/")
+          echo "📦 App bundle: $APP"
+          ENTITLEMENTS=$(codesign -d --entitlements - "$WORK/Payload/$APP" 2>/dev/null || true)
+          echo "--- Entitlements ---"
+          echo "$ENTITLEMENTS"
+          echo "--------------------"
+          if echo "$ENTITLEMENTS" | grep -q "com.apple.developer.applesignin"; then
+            echo "✅ Sign in with Apple entitlement PRESENT"
+          else
+            echo "❌ Sign in with Apple entitlement MISSING — provisioning profile may be outdated"
+            exit 1
+          fi
+          rm -rf "$WORK"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: build/ios/ipa/*.ipa
+
+      - name: Upload iOS debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-debug-symbols
+          path: build/symbols/ios/
+          retention-days: 90
+
+      - name: Resolve IPA path
+        id: ipa
+        run: |
+          IPA_PATH=$(ls build/ios/ipa/*.ipa | head -1)
+          echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+          echo "✅ IPA path: $IPA_PATH"
+
+      - name: Upload to TestFlight
+        uses: apple-actions/upload-testflight-build@v3
+        with:
+          app-path: ${{ steps.ipa.outputs.path }}
+          issuer-id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          api-key-id: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          api-private-key: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+
+      - name: Upload iOS to Firebase App Distribution
+        env:
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID_IOS }}
+          FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          RELEASE_NOTES: ${{ github.event.inputs.release_notes != '' && github.event.inputs.release_notes || github.ref_name }}
+        run: |
+          npm install -g firebase-tools --quiet
+          SA_FILE=$RUNNER_TEMP/firebase-sa.json
+          printf '%s' "$FIREBASE_SA_JSON" > "$SA_FILE"
+          GOOGLE_APPLICATION_CREDENTIALS="$SA_FILE" \
+            firebase appdistribution:distribute "${{ steps.ipa.outputs.path }}" \
+              --app "$FIREBASE_APP_ID" \
+              --groups testers \
+              --release-notes "$RELEASE_NOTES"
+          rm -f "$SA_FILE"
+          echo "✅ iOS IPA uploaded to Firebase App Distribution"
